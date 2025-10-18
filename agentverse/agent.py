@@ -2,6 +2,7 @@ import os
 import requests
 import json
 import time  # Import the time module for delays
+import random # Import the random module for jitter
 from datetime import datetime
 from uuid import uuid4
 
@@ -21,7 +22,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "YOUR_OPENROUTER_API_KEY_HE
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "YOUR_TAVILY_API_KEY_HERE")
 
 # Models and Endpoints
-OPENROUTER_MODEL = "openai/gpt-oss-20b:free"
+OPENROUTER_MODEL = "tngtech/deepseek-r1t2-chimera:free"
 TAVILY_API_URL = "https://api.tavily.com/search"
 BLOCKSCOUT_MCP_URL = "https://mcp.blockscout.com/mcp"
 MAX_RETRIES = 3 # Number of times to retry a failed API call
@@ -53,7 +54,7 @@ protocol = Protocol(spec=chat_protocol_spec)
 
 def call_tavily_search(query: str, ctx: Context) -> str:
     """Performs a web search using the Tavily AI API with retry logic."""
-    if not TAVILY_API_KEY or TAVILY_API_KEY == "YOUR_TAVILY_API_KEY_HERE":
+    if not TAVILY_API_KEY or TAVily_API_KEY == "YOUR_TAVILY_API_KEY_HERE":
         return "Error: Tavily API key is not configured in Agentverse secrets."
     
     for attempt in range(MAX_RETRIES):
@@ -73,7 +74,9 @@ def call_tavily_search(query: str, ctx: Context) -> str:
         except requests.exceptions.RequestException as e:
             ctx.logger.error(f"Tavily API call failed on attempt {attempt + 1}: {e}")
             if attempt < MAX_RETRIES - 1:
-                time.sleep(2)
+                wait_time = (2 ** (attempt + 1)) + (random.random() * 2)
+                ctx.logger.info(f"Waiting for {wait_time:.2f} seconds before retrying...")
+                time.sleep(wait_time)
             else:
                 return f"Error connecting to Tavily API after {MAX_RETRIES} attempts: {e}"
         except Exception as e:
@@ -92,22 +95,37 @@ def call_blockscout_mcp(method: str, params: dict, ctx: Context) -> str:
                 "params": params,
                 "id": 1
             }
-            # **FIX**: Added 'Accept: application/json' header to prevent 406 error.
             headers = {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json'
+                'Accept': 'application/json, text/event-stream',
             }
-            response = requests.post(BLOCKSCOUT_MCP_URL, json=payload, headers=headers, timeout=30)
+            ctx.logger.info(f"Sending Blockscout request with headers: {headers}")
+            response = requests.post(BLOCKSCOUT_MCP_URL, json=payload, headers=headers, timeout=30, stream=True)
             response.raise_for_status()
-            result_data = response.json().get("result", {})
+            
+            full_response_text = ""
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    full_response_text += chunk.decode('utf-8')
+            
+            ctx.logger.info(f"Blockscout raw response: {full_response_text}")
+
+            if not full_response_text:
+                raise ValueError("Received empty response from Blockscout server.")
+
+            result_data = json.loads(full_response_text).get("result", {})
             return json.dumps(result_data)
         
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.RequestException, ValueError) as e:
             ctx.logger.error(f"Blockscout API call failed on attempt {attempt + 1}: {e}")
             if attempt < MAX_RETRIES - 1:
-                time.sleep(2)
+                wait_time = (2 ** (attempt + 1)) + (random.random() * 2)
+                ctx.logger.info(f"Waiting for {wait_time:.2f} seconds before retrying...")
+                time.sleep(wait_time)
             else:
                 return f"Error connecting to Blockscout API after {MAX_RETRIES} attempts: {e}"
+        except json.JSONDecodeError as e:
+            ctx.logger.error(f"Blockscout JSON decode failed: {e}. Response: '{full_response_text}'")
+            return f"Error decoding Blockscout response: {e}"
         except Exception as e:
             return f"An unexpected error occurred during Blockscout call: {e}"
     return f"Error: Blockscout MCP call failed for method '{method}' after all retries."
@@ -121,13 +139,24 @@ def call_openrouter(messages: list, ctx: Context) -> str:
     for attempt in range(MAX_RETRIES):
         try:
             ctx.logger.info(f"Calling OpenRouter API (Attempt {attempt + 1})")
+            
+            payload = {
+                "model": OPENROUTER_MODEL,
+                "messages": messages
+            }
+            
+            # **FIX**: Added HTTP-Referer and X-Title headers to identify our project.
+            # This can help avoid being flagged by API gateways.
+            headers = {
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "HTTP-Referer": "https://fetch.ai/agentverse",
+                "X-Title": "Project Janus Hackathon"
+            }
+            
             response = requests.post(
                 url="https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-                data=json.dumps({
-                    "model": OPENROUTER_MODEL,
-                    "messages": messages
-                }),
+                headers=headers,
+                json=payload,
                 timeout=30
             )
             response.raise_for_status()
@@ -140,8 +169,14 @@ def call_openrouter(messages: list, ctx: Context) -> str:
         
         except requests.exceptions.RequestException as e:
             ctx.logger.error(f"OpenRouter API call failed on attempt {attempt + 1}: {e}")
+            # **FIX**: Added detailed logging of the error response body for better debugging.
+            if e.response is not None:
+                ctx.logger.error(f"Error response body: {e.response.text}")
+            
             if attempt < MAX_RETRIES - 1:
-                time.sleep(2)
+                wait_time = (2 ** (attempt + 1)) + (random.random() * 2)
+                ctx.logger.info(f"Waiting for {wait_time:.2f} seconds before retrying...")
+                time.sleep(wait_time)
             else:
                  return f"Error connecting to OpenRouter API after {MAX_RETRIES} attempts: {e}"
         except Exception as e:
@@ -170,51 +205,54 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
 
     final_response = ""
     try:
-        start_brace = llm_decision_str.rfind('{')
-        end_brace = llm_decision_str.rfind('}') + 1
-        
-        if start_brace != -1 and end_brace != 0 and start_brace < end_brace:
-            json_str = llm_decision_str[start_brace:end_brace]
-            decision_json = json.loads(json_str)
-            
-            tool_name_found = decision_json.get("tool_name")
+        tool_name_found = None
+        if "blockscout_get_address_info" in llm_decision_str:
+            tool_name_found = "blockscout_get_address_info"
+        elif "tavily_search" in llm_decision_str:
+            tool_name_found = "tavily_search"
 
-            if not tool_name_found:
-                ctx.logger.info("Tool name missing in JSON, attempting to infer from context.")
-                if "blockscout_get_address_info" in llm_decision_str:
-                    tool_name_found = "blockscout_get_address_info"
-                elif "tavily_search" in llm_decision_str:
-                    tool_name_found = "tavily_search"
+        if tool_name_found:
+            ctx.logger.info(f"Inferred tool from context: '{tool_name_found}'")
 
-            ctx.logger.info(f"Detected tool '{tool_name_found}' from JSON or context.")
-
-            parameters = decision_json.get("parameters", decision_json)
+            start_brace = llm_decision_str.rfind('{')
+            end_brace = llm_decision_str.rfind('}') + 1
             
-            tool_results = ""
-            if tool_name_found == "tavily_search":
-                search_query = parameters.get("query")
-                if search_query:
-                    tool_results = call_tavily_search(search_query, ctx)
-            elif tool_name_found == "blockscout_get_address_info":
-                chain_id = parameters.get("chain_id")
-                address = parameters.get("address")
-                if chain_id and address:
-                    tool_results = call_blockscout_mcp("get_address_info", {"chain_id": chain_id, "address": address}, ctx)
-            
-            if tool_results:
-                ctx.logger.info("Sending tool results to LLM for final synthesis...")
-                synthesis_messages = messages + [
-                    {"role": "assistant", "content": json_str},
-                    {"role": "tool", "name": tool_name_found, "content": tool_results},
-                ]
-                final_response = call_openrouter(synthesis_messages, ctx)
+            if start_brace != -1 and end_brace != 0 and start_brace < end_brace:
+                json_str = llm_decision_str[start_brace:end_brace]
+                decision_json = json.loads(json_str)
+                parameters = decision_json.get("parameters", decision_json)
+                
+                tool_results = ""
+                if tool_name_found == "tavily_search":
+                    search_query = parameters.get("query")
+                    if search_query:
+                        tool_results = call_tavily_search(search_query, ctx)
+                elif tool_name_found == "blockscout_get_address_info":
+                    chain_id = parameters.get("chain_id")
+                    address = parameters.get("address")
+                    if chain_id and address:
+                        tool_results = call_blockscout_mcp("get_address_info", {"chain_id": chain_id, "address": address}, ctx)
+                
+                if tool_results:
+                    ctx.logger.info("Sending tool results to LLM for final synthesis...")
+                    synthesis_messages = messages + [
+                        {"role": "assistant", "content": json_str},
+                        {"role": "tool", "name": tool_name_found, "content": tool_results},
+                    ]
+                    final_response = call_openrouter(synthesis_messages, ctx)
+                else:
+                    final_response = "I tried to use a tool, but I couldn't find the necessary parameters in your request. Please be more specific."
             else:
-                final_response = "I tried to use a tool, but I couldn't find the necessary parameters in your request. Please be more specific."
+                final_response = "I tried to use a tool, but something went wrong with its format. Please try again."
         else:
             final_response = llm_decision_str
 
     except (json.JSONDecodeError, TypeError):
         final_response = llm_decision_str
+    except NameError as e:
+        ctx.logger.error(f"A NameError occurred: {e}")
+        final_response = "I encountered an internal error. The developer has been notified."
+
 
     await ctx.send(sender, ChatMessage(
         timestamp=datetime.utcnow(),
