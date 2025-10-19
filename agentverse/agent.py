@@ -5,6 +5,7 @@ import time  # Import the time module for delays
 import random # Import the random module for jitter
 from datetime import datetime
 from uuid import uuid4
+from typing import Tuple, Dict, Any, Optional
 
 from uagents import Agent, Context, Protocol
 from uagents.setup import fund_agent_if_low
@@ -26,18 +27,20 @@ OPENROUTER_MODEL = "openai/gpt-oss-20b:free"
 TAVILY_API_URL = "https://api.tavily.com/search"
 BLOCKSCOUT_MCP_URL = "https://mcp.blockscout.com/mcp"
 MAX_RETRIES = 1 
+MAX_REASONING_STEPS = 5 # Max number of tool calls per query
 
 # This is the main system prompt that gives the LLM its instructions and tools.
 SYSTEM_PROMPT = """You are Janus, a world-class crypto analyst agent. Your goal is to provide accurate, up-to-date answers to user queries by combining web search with on-chain data analysis.
 
-You have access to powerful tools to help you:
-- **tavily_search(query: str):** Use this for real-time web information, news, or market sentiment.
+You have access to powerful tools. You can call them sequentially to gather information.
+
+- **tavily_search(query: str):** Use this for real-time web information, news, or to find entities like wallet addresses.
 - **blockscout_get_address_info(chain_id: str, address: str):** Use this to get detailed on-chain data for a specific crypto address. The chain_id for Ethereum Mainnet is "1".
 
 To use a tool, you must respond ONLY with a JSON object in the following format:
 {"tool_name": "<tool_name>", "parameters": {"<param_name>": "<param_value>"}}
 
-When you receive the results from a tool, you must use them to formulate a comprehensive, human-readable answer to the user's original question.
+After using a tool, I will provide you with the results. You can then use another tool or, if you have enough information, provide a final comprehensive answer in plain text.
 """
 
 # --- Agent and Protocol Setup ---
@@ -204,6 +207,62 @@ def call_openrouter(messages: list, ctx: Context) -> str:
             return f"An unexpected error occurred with the LLM call: {e}"
     return "Error: OpenRouter call failed after all retries."
 
+# --- New Helper Functions for Agentic Logic ---
+
+def parse_tool_call(llm_output: str, ctx: Context) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Parses the LLM's output to find a valid tool call JSON."""
+    try:
+        start_token = "<|message|>"
+        end_token = "<|call|>"
+        start_index = llm_output.rfind(start_token)
+        end_index = llm_output.rfind(end_token)
+
+        if start_index != -1 and end_index != -1 and start_index < end_index:
+            json_str = llm_output[start_index + len(start_token):end_index].strip()
+            ctx.logger.info(f"Extracted JSON string from special tokens: {json_str}")
+            data = json.loads(json_str)
+            
+            # Standard format: {"tool_name": "...", "parameters": {...}}
+            if "tool_name" in data and "parameters" in data:
+                return data["tool_name"], data["parameters"]
+
+            # Alternative format: {"tavily_search": {"query": ...}}
+            for key, value in data.items():
+                if isinstance(value, dict):
+                    if key in ["tavily_search", "blockscout_get_address_info"]:
+                        return key, value
+            
+            # **FIX**: Fallback logic. If no tool name is found in the JSON,
+            # infer it from the full LLM output context.
+            ctx.logger.info("Tool name not in JSON, attempting to infer from LLM's thought process.")
+            if "blockscout_get_address_info" in llm_output:
+                return "blockscout_get_address_info", data
+            elif "tavily_search" in llm_output:
+                return "tavily_search", data
+            
+    except json.JSONDecodeError as e:
+        ctx.logger.warning(f"JSON decode failed for extracted string: {e}")
+    
+    ctx.logger.warning("Could not find a valid tool call.")
+    return None, None
+
+def execute_tool(tool_name: str, parameters: dict, ctx: Context) -> str:
+    """Executes the appropriate tool based on the parsed name and parameters."""
+    if tool_name == "tavily_search":
+        query = parameters.get("query")
+        if query:
+            return call_tavily_search(query, ctx)
+    elif tool_name == "blockscout_get_address_info":
+        chain_id = parameters.get("chain_id")
+        address = parameters.get("address")
+        if chain_id and address:
+            return call_blockscout_mcp(
+                "get_address_info",
+                {"chain_id": str(chain_id), "address": address},
+                ctx
+            )
+    return "Error: Tool execution failed, parameters might be missing."
+
 
 # --- Message Handlers ---
 @protocol.on_message(model=ChatMessage)
@@ -221,81 +280,38 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
         {"role": "user", "content": user_query}
     ]
     
-    llm_decision_str = call_openrouter(messages, ctx)
-    ctx.logger.info(f"LLM decision: {llm_decision_str}")
-
     final_response = ""
-    try:
-        tool_name_found = None
-        if "blockscout_get_address_info" in llm_decision_str:
-            tool_name_found = "blockscout_get_address_info"
-        elif "tavily_search" in llm_decision_str:
-            tool_name_found = "tavily_search"
 
-        if tool_name_found:
-            ctx.logger.info(f"Inferred tool from context: '{tool_name_found}'")
+    # Implemented a reasoning loop for multi-step tasks.
+    for i in range(MAX_REASONING_STEPS):
+        ctx.logger.info(f"Reasoning Step {i+1}/{MAX_REASONING_STEPS}")
+        
+        llm_decision_str = call_openrouter(messages, ctx)
+        ctx.logger.info(f"LLM decision: {llm_decision_str}")
 
-            start_brace = llm_decision_str.rfind('{')
-            end_brace = llm_decision_str.rfind('}') + 1
+        tool_name, parameters = parse_tool_call(llm_decision_str, ctx)
+
+        if tool_name and parameters:
+            ctx.logger.info(f"Executing tool '{tool_name}' with params: {parameters}")
             
-            if start_brace != -1 and end_brace != 0 and start_brace < end_brace:
-                json_str = llm_decision_str[start_brace:end_brace]
-                decision_json = json.loads(json_str)
-                parameters = decision_json.get("parameters", decision_json)
-                
-                tool_results = ""
-                if tool_name_found == "tavily_search":
-                    search_query = parameters.get("query")
-                    if search_query:
-                        tool_results = call_tavily_search(search_query, ctx)
-                elif tool_name_found == "blockscout_get_address_info":
-                    chain_id = parameters.get("chain_id")
-                    address = parameters.get("address")
-                    if chain_id and address:
-                        tool_results = call_blockscout_mcp(
-                            "get_address_info", 
-                            {"chain_id": str(chain_id), "address": address}, 
-                            ctx
-                        )
-                
-                if tool_results:
-                    try:
-                        tool_data = json.loads(tool_results)
-                        if 'data' in tool_data: 
-                            pruned_data = {
-                                "basic_info": tool_data.get("data", {}).get("basic_info"),
-                                "tags": [tag.get("name") for tag in tool_data.get("data", {}).get("metadata", {}).get("tags", [])]
-                            }
-                            tool_results = json.dumps(pruned_data)
-                            ctx.logger.info(f"Pruned Blockscout data for LLM: {tool_results}")
-                    except (json.JSONDecodeError, TypeError):
-                        ctx.logger.warning("Could not prune tool results, passing raw.")
+            # Append the LLM's decision to use a tool to the conversation history
+            messages.append({"role": "assistant", "content": llm_decision_str})
+            
+            tool_results = execute_tool(tool_name, parameters, ctx)
+            ctx.logger.info(f"Tool results: {tool_results}")
 
-                    ctx.logger.info("Sending tool results to LLM for final synthesis...")
-                    
-                    # **FIX**: Re-structured the synthesis message to be a simple assistant message
-                    # This avoids the unsupported 'role: tool' and is more compatible.
-                    synthesis_messages = messages + [
-                        {
-                            "role": "assistant",
-                            "content": f"I have retrieved the following on-chain data: {tool_results}. Now I will formulate a response."
-                        }
-                    ]
-
-                    ctx.logger.info(f"Final synthesis payload for OpenRouter: {json.dumps(synthesis_messages)}")
-                    final_response = call_openrouter(synthesis_messages, ctx)
-                else:
-                    final_response = "I tried to use a tool, but I couldn't find the necessary parameters in your request. Please be more specific."
-            else:
-                final_response = "I tried to use a tool, but something went wrong with its format. Please try again."
+            # Append the tool's results to the conversation history
+            messages.append({
+                "role": "assistant",
+                "content": f"I have retrieved the following data: {tool_results}. I will now decide the next step."
+            })
         else:
+            # If no tool call is detected, the LLM's output is the final answer
             final_response = llm_decision_str
-
-    except (json.JSONDecodeError, TypeError):
-        final_response = llm_decision_str
-    except NameError as e:
-        ctx.logger.error(f"A NameError occurred: {e}")
-        final_response = "I encountered an internal error. The developer has been notified."
+            break
+    else:
+        # Loop finished without the LLM providing a final answer
+        final_response = "I seem to be stuck in a reasoning loop. Could you please rephrase your question?"
 
 
     await ctx.send(sender, ChatMessage(
