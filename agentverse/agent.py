@@ -22,10 +22,10 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "YOUR_OPENROUTER_API_KEY_HE
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "YOUR_TAVILY_API_KEY_HERE")
 
 # Models and Endpoints
-OPENROUTER_MODEL = "tngtech/deepseek-r1t2-chimera:free"
+OPENROUTER_MODEL = "openai/gpt-oss-20b:free"
 TAVILY_API_URL = "https://api.tavily.com/search"
 BLOCKSCOUT_MCP_URL = "https://mcp.blockscout.com/mcp"
-MAX_RETRIES = 3 # Number of times to retry a failed API call
+MAX_RETRIES = 1 
 
 # This is the main system prompt that gives the LLM its instructions and tools.
 SYSTEM_PROMPT = """You are Janus, a world-class crypto analyst agent. Your goal is to provide accurate, up-to-date answers to user queries by combining web search with on-chain data analysis.
@@ -54,7 +54,7 @@ protocol = Protocol(spec=chat_protocol_spec)
 
 def call_tavily_search(query: str, ctx: Context) -> str:
     """Performs a web search using the Tavily AI API with retry logic."""
-    if not TAVILY_API_KEY or TAVily_API_KEY == "YOUR_TAVILY_API_KEY_HERE":
+    if not TAVILY_API_KEY or TAVILY_API_KEY == "YOUR_TAVILY_API_KEY_HERE":
         return "Error: Tavily API key is not configured in Agentverse secrets."
     
     for attempt in range(MAX_RETRIES):
@@ -84,21 +84,26 @@ def call_tavily_search(query: str, ctx: Context) -> str:
     return "Error: Tavily search failed after all retries."
 
 
-def call_blockscout_mcp(method: str, params: dict, ctx: Context) -> str:
-    """Calls a method on the Blockscout MCP API with retry logic."""
+def call_blockscout_mcp(tool_name: str, arguments: dict, ctx: Context) -> str:
+    """Calls a method on the Blockscout MCP API with the correct nested structure."""
     for attempt in range(MAX_RETRIES):
+        last_event = "" 
         try:
-            ctx.logger.info(f"Calling Blockscout MCP method '{method}' (Attempt {attempt + 1})")
             payload = {
                 "jsonrpc": "2.0",
-                "method": method,
-                "params": params,
-                "id": 1
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": tool_name,
+                    "arguments": arguments
+                }
             }
+            ctx.logger.info(f"Constructed Blockscout payload: {json.dumps(payload)}")
+            
             headers = {
                 'Accept': 'application/json, text/event-stream',
             }
-            ctx.logger.info(f"Sending Blockscout request with headers: {headers}")
+            
             response = requests.post(BLOCKSCOUT_MCP_URL, json=payload, headers=headers, timeout=30, stream=True)
             response.raise_for_status()
             
@@ -107,13 +112,32 @@ def call_blockscout_mcp(method: str, params: dict, ctx: Context) -> str:
                 if chunk:
                     full_response_text += chunk.decode('utf-8')
             
-            ctx.logger.info(f"Blockscout raw response: {full_response_text}")
+            ctx.logger.info(f"Blockscout raw response stream: {full_response_text}")
 
             if not full_response_text:
                 raise ValueError("Received empty response from Blockscout server.")
 
-            result_data = json.loads(full_response_text).get("result", {})
-            return json.dumps(result_data)
+            events = full_response_text.strip().split('event: message')
+            last_event = next((event for event in reversed(events) if event.strip()), None)
+
+            if last_event and 'data: ' in last_event:
+                data_part = last_event.split('data: ')[1]
+                parsed_response = json.loads(data_part)
+
+                if "error" in parsed_response:
+                    error_details = parsed_response["error"]
+                    ctx.logger.error(f"Blockscout server returned an error: {error_details}")
+                    return json.dumps(error_details) 
+
+                content = parsed_response.get("result", {}).get("content", [])
+                if content and isinstance(content, list) and "text" in content[0]:
+                    nested_json_string = content[0]["text"]
+                    final_data = json.loads(nested_json_string)
+                    return json.dumps(final_data)
+                else:
+                    return json.dumps(parsed_response.get("result", {}))
+            else:
+                raise ValueError("Could not find a valid final data message in the event stream.")
         
         except (requests.exceptions.RequestException, ValueError) as e:
             ctx.logger.error(f"Blockscout API call failed on attempt {attempt + 1}: {e}")
@@ -124,11 +148,11 @@ def call_blockscout_mcp(method: str, params: dict, ctx: Context) -> str:
             else:
                 return f"Error connecting to Blockscout API after {MAX_RETRIES} attempts: {e}"
         except json.JSONDecodeError as e:
-            ctx.logger.error(f"Blockscout JSON decode failed: {e}. Response: '{full_response_text}'")
+            ctx.logger.error(f"Blockscout JSON decode failed: {e}. Offending text: '{last_event}'")
             return f"Error decoding Blockscout response: {e}"
         except Exception as e:
             return f"An unexpected error occurred during Blockscout call: {e}"
-    return f"Error: Blockscout MCP call failed for method '{method}' after all retries."
+    return f"Error: Blockscout MCP call failed for tool '{tool_name}' after all retries."
 
 
 def call_openrouter(messages: list, ctx: Context) -> str:
@@ -145,8 +169,6 @@ def call_openrouter(messages: list, ctx: Context) -> str:
                 "messages": messages
             }
             
-            # **FIX**: Added HTTP-Referer and X-Title headers to identify our project.
-            # This can help avoid being flagged by API gateways.
             headers = {
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "HTTP-Referer": "https://fetch.ai/agentverse",
@@ -169,7 +191,6 @@ def call_openrouter(messages: list, ctx: Context) -> str:
         
         except requests.exceptions.RequestException as e:
             ctx.logger.error(f"OpenRouter API call failed on attempt {attempt + 1}: {e}")
-            # **FIX**: Added detailed logging of the error response body for better debugging.
             if e.response is not None:
                 ctx.logger.error(f"Error response body: {e.response.text}")
             
@@ -185,7 +206,7 @@ def call_openrouter(messages: list, ctx: Context) -> str:
 
 
 # --- Message Handlers ---
-@protocol.on_message(ChatMessage)
+@protocol.on_message(model=ChatMessage)
 async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
     await ctx.send(
         sender,
@@ -231,14 +252,37 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
                     chain_id = parameters.get("chain_id")
                     address = parameters.get("address")
                     if chain_id and address:
-                        tool_results = call_blockscout_mcp("get_address_info", {"chain_id": chain_id, "address": address}, ctx)
+                        tool_results = call_blockscout_mcp(
+                            "get_address_info", 
+                            {"chain_id": str(chain_id), "address": address}, 
+                            ctx
+                        )
                 
                 if tool_results:
+                    try:
+                        tool_data = json.loads(tool_results)
+                        if 'data' in tool_data: 
+                            pruned_data = {
+                                "basic_info": tool_data.get("data", {}).get("basic_info"),
+                                "tags": [tag.get("name") for tag in tool_data.get("data", {}).get("metadata", {}).get("tags", [])]
+                            }
+                            tool_results = json.dumps(pruned_data)
+                            ctx.logger.info(f"Pruned Blockscout data for LLM: {tool_results}")
+                    except (json.JSONDecodeError, TypeError):
+                        ctx.logger.warning("Could not prune tool results, passing raw.")
+
                     ctx.logger.info("Sending tool results to LLM for final synthesis...")
+                    
+                    # **FIX**: Re-structured the synthesis message to be a simple assistant message
+                    # This avoids the unsupported 'role: tool' and is more compatible.
                     synthesis_messages = messages + [
-                        {"role": "assistant", "content": json_str},
-                        {"role": "tool", "name": tool_name_found, "content": tool_results},
+                        {
+                            "role": "assistant",
+                            "content": f"I have retrieved the following on-chain data: {tool_results}. Now I will formulate a response."
+                        }
                     ]
+
+                    ctx.logger.info(f"Final synthesis payload for OpenRouter: {json.dumps(synthesis_messages)}")
                     final_response = call_openrouter(synthesis_messages, ctx)
                 else:
                     final_response = "I tried to use a tool, but I couldn't find the necessary parameters in your request. Please be more specific."
@@ -261,7 +305,7 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
     ))
 
 
-@protocol.on_message(ChatAcknowledgement)
+@protocol.on_message(model=ChatAcknowledgement)
 async def handle_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
     ctx.logger.info(f"Received acknowledgement from {sender} for message {msg.acknowledged_msg_id}")
 
