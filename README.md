@@ -1,4 +1,4 @@
-# **Project Janus \- Your On-Chain Oracle Agent**
+# **Project Janus \- Your OnChain and OffChain Crypto Agent**
 
 **Project Janus** is an intelligent AI agent designed to provide insightful analysis of the crypto landscape by seamlessly integrating real-time on-chain data with off-chain web information. Built for the Ethereum Hackathon, Janus acts as a knowledgeable assistant, helping users understand market movements, track key players, and monitor network health.
 
