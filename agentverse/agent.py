@@ -26,23 +26,25 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "YOUR_TAVILY_API_KEY_HERE")
 OPENROUTER_MODEL = "openai/gpt-oss-20b:free"
 TAVILY_API_URL = "https://api.tavily.com/search"
 BLOCKSCOUT_MCP_URL = "https://mcp.blockscout.com/mcp"
-MAX_RETRIES = 1 
+MAX_RETRIES = 1
 MAX_REASONING_STEPS = 7 # Max number of tool calls per query
 
 # --- System Prompt ---
+# **UPDATED**: Added the get_latest_block tool.
 SYSTEM_PROMPT = """You are Janus, a world-class crypto analyst agent. Your goal is to provide accurate, up-to-date answers to user queries by combining web search with on-chain data analysis.
 
 You have access to powerful tools. You can call them sequentially to gather information.
 
 - **tavily_search(query: str):** Use this for real-time web information, news, or to find entities like wallet addresses.
 - **blockscout_get_address_info(chain_id: str, address: str):** Use this to get a detailed profile of a specific crypto address.
-- **blockscout_get_token_transfers_by_address(chain_id: str, address: str):** Use this to get the latest ERC-20 token transfers for an address. This is crucial for spotting recent purchases or sales.
+- **blockscout_get_token_transfers_by_address(chain_id: str, address: str):** Use this to get the latest ERC-20 token transfers for an address.
 - **blockscout_get_transactions_by_address(chain_id: str, address: str):** Use this to get the latest native coin (e.g., ETH) transactions for an address.
+- **blockscout_get_latest_block(chain_id: str):** Use this to get information about the most recent block, including the current base gas fee.
 
 To use a tool, you must respond ONLY with a JSON object in the following format:
 {"tool_name": "<tool_name>", "parameters": {"<param_name>": "<param_value>"}}
 
-After using a tool, I will provide you with the results. You can then use another tool or, if you have enough information, provide a final comprehensive answer in plain text.
+After using a tool, I will provide you with the results. You can then use another tool or, if you have enough information, provide a final comprehensive answer in plain text. Use chain_id "1" for Ethereum Mainnet unless specified otherwise.
 """
 
 # --- Agent and Protocol Setup ---
@@ -71,6 +73,10 @@ def call_tavily_search(query: str, ctx: Context) -> str:
 def call_blockscout_mcp(tool_name: str, arguments: dict, ctx: Context) -> str:
     """Calls a method on the Blockscout MCP API with the correct nested structure."""
     try:
+        # **FIX**: Ensure chain_id is always passed as a string in arguments.
+        if 'chain_id' in arguments:
+            arguments['chain_id'] = str(arguments['chain_id'])
+            
         payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool_name, "arguments": arguments}}
         ctx.logger.info(f"Constructed Blockscout payload: {json.dumps(payload)}")
         headers = {'Accept': 'application/json, text/event-stream'}
@@ -83,9 +89,9 @@ def call_blockscout_mcp(tool_name: str, arguments: dict, ctx: Context) -> str:
         if not full_response_text: raise ValueError("Empty response from Blockscout.")
 
         events = full_response_text.strip().split('event: message')
-        last_event = next((event for event in reversed(events) if event.strip()), None)
+        last_event = next((event for event in reversed(events) if event.strip() and 'data: ' in event), None) # Ensure 'data: ' exists
 
-        if last_event and 'data: ' in last_event:
+        if last_event:
             data_part = last_event.split('data: ', 1)[1]
             parsed_response = json.loads(data_part)
 
@@ -95,13 +101,13 @@ def call_blockscout_mcp(tool_name: str, arguments: dict, ctx: Context) -> str:
 
             content = parsed_response.get("result", {}).get("content", [])
             if content and "text" in content[0]:
-                # If the content is a nested JSON string, parse it.
+                 # Try to parse the text field as JSON, otherwise return as string
                 try:
                     nested_data = json.loads(content[0]["text"])
                     return json.dumps(nested_data)
                 except json.JSONDecodeError:
-                    # Otherwise, return the text directly.
-                    return content[0]["text"]
+                    return content[0]["text"] # Return the raw text if not JSON
+            # If no 'content'/'text', return the whole result part
             return json.dumps(parsed_response.get("result", {}))
         else:
             raise ValueError("No valid final data message in event stream.")
@@ -115,7 +121,7 @@ def call_openrouter(messages: list, ctx: Context) -> str:
         return "Error: OpenRouter API key is not configured."
     try:
         headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "HTTP-Referer": "https://fetch.ai/agentverse", "X-Title": "Project Janus"}
-        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json={"model": OPENROUTER_MODEL, "messages": messages}, timeout=30)
+        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json={"model": OPENROUTER_MODEL, "messages": messages}, timeout=60) # Increased timeout
         response.raise_for_status()
         return response.json()['choices'][0]['message']['content']
     except requests.exceptions.RequestException as e:
@@ -136,37 +142,53 @@ def parse_tool_call(llm_output: str, ctx: Context) -> Optional[Tuple[str, Dict[s
             ctx.logger.info(f"Extracted JSON from special tokens: {json_str}")
             data = json.loads(json_str)
             
+            # Standard format: {"tool_name": "...", "parameters": {...}}
             if "tool_name" in data and "parameters" in data: 
                 return data["tool_name"], data["parameters"]
             
+            # Alternative format: {"tavily_search": {"query": ...}}
             for key, value in data.items():
                 if isinstance(value, dict):
-                    if key in ["tavily_search", "blockscout_get_address_info", "blockscout_get_token_transfers_by_address", "blockscout_get_transactions_by_address"]:
+                     # Use the full internal names for matching
+                    if key in ["tavily_search", "blockscout_get_address_info", "blockscout_get_token_transfers_by_address", "blockscout_get_transactions_by_address", "blockscout_get_latest_block"]:
                         return key, value
             
-            ctx.logger.warning("Tool name not in JSON, attempting inference.")
-            known_tools = ["blockscout_get_address_info", "blockscout_get_token_transfers_by_address", "blockscout_get_transactions_by_address", "tavily_search"]
+            # Fallback logic: Infer tool name from context if missing in JSON
+            ctx.logger.warning("Tool name not in JSON, attempting inference from context.")
+            known_tools = ["blockscout_get_address_info", "blockscout_get_token_transfers_by_address", "blockscout_get_transactions_by_address", "blockscout_get_latest_block", "tavily_search"]
             for tool in known_tools:
+                # Check if the full tool name exists in the LLM's raw output string
                 if tool in llm_output:
                     ctx.logger.info(f"Inferred tool name: {tool}")
-                    return tool, data
+                    return tool, data # Return the full internal name
     except Exception as e:
-        ctx.logger.warning(f"JSON parsing failed: {e}")
+        ctx.logger.warning(f"JSON parsing or tool inference failed: {e}")
+    
+    ctx.logger.warning("Could not identify a valid tool call.")
     return None, None
 
 def execute_tool(tool_name: str, parameters: dict, ctx: Context) -> str:
     """Executes the appropriate tool by mapping the internal name to the API-specific name."""
     ctx.logger.info(f"Executing tool '{tool_name}' with params: {parameters}")
 
-    # **FIX**: This map now correctly uses the FULL tool names required by the Blockscout API.
+    # Map internal agent tool names to the specific names required by the Blockscout MCP API
     tool_map = {
         "tavily_search": lambda p: call_tavily_search(p.get("query"), ctx),
         "blockscout_get_address_info": lambda p: call_blockscout_mcp("get_address_info", {"chain_id": str(p.get("chain_id")), "address": p.get("address")}, ctx),
         "blockscout_get_token_transfers_by_address": lambda p: call_blockscout_mcp("get_token_transfers_by_address", {"chain_id": str(p.get("chain_id")), "address": p.get("address")}, ctx),
         "blockscout_get_transactions_by_address": lambda p: call_blockscout_mcp("get_transactions_by_address", {"chain_id": str(p.get("chain_id")), "address": p.get("address")}, ctx),
+        "blockscout_get_latest_block": lambda p: call_blockscout_mcp("get_latest_block", {"chain_id": str(p.get("chain_id"))}, ctx), # Added new tool mapping
     }
     
     if tool_name in tool_map:
+        # Basic parameter validation
+        if tool_name.startswith("blockscout_") and not parameters.get("chain_id"):
+             return "Error: Missing 'chain_id' parameter for Blockscout tool."
+        if tool_name in ["blockscout_get_address_info", "blockscout_get_token_transfers_by_address", "blockscout_get_transactions_by_address"] and not parameters.get("address"):
+             return "Error: Missing 'address' parameter for this Blockscout tool."
+        if tool_name == "tavily_search" and not parameters.get("query"):
+             return "Error: Missing 'query' parameter for Tavily search."
+             
         return tool_map[tool_name](parameters)
     
     ctx.logger.error(f"Unknown tool name: '{tool_name}'")
@@ -193,12 +215,12 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
             messages.append({"role": "assistant", "content": llm_decision_str})
             tool_results = execute_tool(tool_name, parameters, ctx)
             ctx.logger.info(f"Tool results: {tool_results}")
-            messages.append({"role": "assistant", "content": f"I have retrieved the following data: {tool_results}. I will now decide the next step."})
+            messages.append({"role": "assistant", "content": f"I have retrieved the following data using the {tool_name} tool: {tool_results}. I will now decide the next step or formulate the final answer."})
         else:
             final_response = llm_decision_str
             break
     else:
-        final_response = "I seem to be stuck in a reasoning loop. Could you please rephrase your question?"
+        final_response = "I seem to be stuck in a reasoning loop or reached the maximum steps. Could you please rephrase your question?"
 
     await ctx.send(sender, ChatMessage(timestamp=datetime.utcnow(), msg_id=uuid4(), content=[TextContent(type="text", text=final_response), EndSessionContent(type="end-session")]))
 
